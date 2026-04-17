@@ -370,18 +370,26 @@ class EDMInstantMomentMatchLoss:
     def _teacher_jvp_direction(self, z_s, sigma_s_vec, labels, augment_labels, nu):
         params = {name: p for name, p in self.teacher_net.named_parameters()}
         buffers = {name: b for name, b in self.teacher_net.named_buffers()}
-        tangents = {name: v for name, v in zip(self._teacher_param_names, nu)}
+        state = {}
+        state.update(params)
+        state.update(buffers)
 
-        def f(pdict):
+        tangent_state = {}
+        for name, v in zip(self._teacher_param_names, nu):
+            tangent_state[name] = v
+        for name, b in self.teacher_net.named_buffers():
+            tangent_state[name] = torch.zeros_like(b)
+        
+        def f(state_dict):
             out = functional_call(
                 self.teacher_net,
-                (pdict, buffers),
+                state_dict,
                 (z_s, sigma_s_vec, labels),
                 {'augment_labels': augment_labels},
             )
             return out.to(torch.float32)
 
-        _, jvp_out = jvp(f, (params,), (tangents,))
+        _, jvp_out = jvp(f, (state,), (tangent_state,))
         return jvp_out.detach()
     
     def __call__(self, net, images_a, labels_a=None, images_b=None, labels_b=None, augment_pipe=None):
