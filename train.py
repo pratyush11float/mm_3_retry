@@ -75,6 +75,9 @@ def parse_float_list(s):
     default='edm',
     show_default=True,
 )
+@click.option('--momentmatch_algo', type=click.Choice(['2', '3']), default='3', show_default=True)
+@click.option('--mm_precond', type=click.Choice(['identity', 'adam']), default='identity', show_default=True)
+@click.option('--teacher_state_dump', metavar='PT', type=str, default=None)
 
 # Hyperparameters.
 @click.option('--duration',      help='Training duration', metavar='MIMG',                          type=click.FloatRange(min=0, min_open=True), default=200, show_default=True)
@@ -220,32 +223,51 @@ def main(**kwargs):
             raise click.ClickException('--momentmatch=True requires --precond=edm')
         if not opts.teacher:
             raise click.ClickException('--momentmatch=True requires --teacher=PKL|URL')
+
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         with dnnlib.util.open_url(opts.teacher, verbose=(dist.get_rank() == 0)) as f:
             teacher_data = pickle.load(f)
+
         if isinstance(teacher_data, dict) and ('ema' in teacher_data or 'net' in teacher_data):
             teacher = teacher_data['ema'] if 'ema' in teacher_data else teacher_data['net']
         else:
             teacher = teacher_data
-        teacher = teacher.eval().requires_grad_(False).to(device)
-        aux_net = copy.deepcopy(teacher).train().requires_grad_(True).to(device)
-        # Zero out dropout on the auxiliary so it matches --dropout=0.
-        # The deep-copied teacher may have had a non-zero dropout baked into
-        # its UNetBlocks; we override it here to honour the paper's setup.
-        for m in aux_net.modules():
-            if hasattr(m, 'dropout') and isinstance(m.dropout, (int, float)):
-                m.dropout = float(opts.dropout)
-        c.loss_kwargs.class_name = 'training.loss_mm.EDMMomentMatchLoss'
-        c.loss_kwargs.update(
-            teacher_net=teacher,
-            aux_net=aux_net,
-            k=opts.S,
-            sigma_min=opts.sigma_min,
-            sigma_max=opts.sigma_max,
-            rho=opts.rho,
-            weight_mode=opts.mm_weight_mode,
-            sync_dropout=opts.sync_dropout,
-        )
+
+        teacher = teacher.eval().to(device)
+        
+        # ----------------------------
+        # Algorithm 2: create aux_net
+        # ----------------------------
+
+        if opts.momentmatch_algo == '2':
+            aux_net = copy.deepcopy(teacher).train().requires_grad_(True).to(device)
+            c.loss_kwargs.class_name = 'training.loss_mm.EDMMomentMatchLoss'
+            c.loss_kwargs.update(
+                teacher_net=teacher,
+                aux_net=aux_net,
+                k=opts.S,
+                sigma_min=opts.sigma_min,
+                sigma_max=opts.sigma_max,
+                rho=opts.rho,
+                weight_mode=opts.mm_weight_mode,
+                sync_dropout=opts.sync_dropout,
+            )
+        
+        # ----------------------------
+        # Algorithm 3: DO NOT create aux_net
+        # ----------------------------    
+        else:
+            c.loss_kwargs.class_name = 'training.loss_mm.EDMInstantMomentMatchLoss'
+            c.loss_kwargs.update(
+                teacher_net=teacher,
+                k=opts.S,
+                sigma_min=opts.sigma_min,
+                sigma_max=opts.sigma_max,
+                rho=opts.rho,
+                weight_mode=opts.mm_weight_mode,
+                precond_mode=opts.mm_precond,
+                teacher_state_dump=opts.teacher_state_dump,
+            )
         c.teacher = opts.teacher
 
     # Network options.

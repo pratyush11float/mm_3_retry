@@ -181,17 +181,26 @@ def training_loop(
     
 
     # Moment Matching mode: set up auxiliary optimizer.
-    is_mm_mode = hasattr(loss_fn, 'aux_net') and loss_fn.aux_net is not None
+    # Algo 2 => explicit auxiliary model + alternating optimization.
+    # Algo 3 => no auxiliary model, but loss asks for two independent minibatches.
+    is_mm_algo2 = hasattr(loss_fn, 'aux_net') and getattr(loss_fn, 'aux_net', None) is not None
+    is_mm_algo3 = bool(getattr(loss_fn, 'requires_two_batches', False))
+    is_mm_mode = is_mm_algo2 or is_mm_algo3
+
     optimizer_aux = None
-    if is_mm_mode:
+    if is_mm_algo2:
         aux_net = loss_fn.aux_net
         if hasattr(aux_net, 'use_fp16') and not aux_net.use_fp16:
             dist.print0('[OVERRIDE] Forcing use_fp16=True on auxiliary network')
             aux_net.use_fp16 = True
+
         optimizer_aux = dnnlib.util.construct_class_by_name(
             params=aux_net.parameters(), **optimizer_kwargs,
         )
-        dist.print0(f'[MM INIT] Moment Matching mode enabled: alternating optimisation of student & auxiliary.')
+        dist.print0('[MM INIT] Algorithm 2 mode enabled: alternating optimisation of student & auxiliary.')
+
+    elif is_mm_algo3:
+        dist.print0('[MM INIT] Algorithm 3 mode enabled: two-batch instant moment matching (no auxiliary optimizer).')
 
     # Optional W&B initialization (async/threaded).
     wandb_run = None
@@ -250,13 +259,13 @@ def training_loop(
                 dist.print0('[PHEMA] Loaded power-function EMA state from training state.')
             except Exception as _e:
                 dist.print0(f'[PHEMA] Failed to load PHEMA state: {_e}')
-        if is_mm_mode and 'aux_net' in data:
+        if is_mm_algo2 and 'aux_net' in data:
             try:
                 misc.copy_params_and_buffers(src_module=data['aux_net'], dst_module=loss_fn.aux_net, require_all=False)
                 dist.print0('[MM] Loaded auxiliary model from training state.')
             except Exception as _e:
                 dist.print0(f'[MM] Failed to load auxiliary model: {_e}')
-        if is_mm_mode and optimizer_aux is not None and 'optimizer_aux_state' in data:
+        if is_mm_algo2 and optimizer_aux is not None and 'optimizer_aux_state' in data:
             try:
                 optimizer_aux.load_state_dict(data['optimizer_aux_state'])
                 dist.print0('[MM] Loaded auxiliary optimizer state from training state.')
@@ -348,9 +357,13 @@ def training_loop(
     dist.update_progress(cur_nimg // 1000, total_kimg)
     stats_jsonl = None
     step_stats_jsonl = None
-    total_steps = int(total_kimg * 1000 / batch_size)
-    cur_step = int(resume_kimg * 1000 / batch_size) if resume_kimg > 0 else 0
+    
+    consumed_images_per_step = batch_size * (2 if is_mm_algo3 else 1) # Divide by two since two mini batches run simultaneously
+
+    total_steps = int(total_kimg * 1000 / consumed_images_per_step)
+    cur_step = int(resume_kimg * 1000 / consumed_images_per_step) if resume_kimg > 0 else 0
     ema_updates = 0
+    
     last_loss_scalar = None
     step_metrics_every = max(int(step_metrics_every or 0), 0)
     while True:
@@ -370,9 +383,9 @@ def training_loop(
         if hasattr(loss_fn, '_collect_step_metrics'):
             loss_fn._collect_step_metrics = _will_collect
 
-        # Determine even/odd for MM alternation.
-        mm_is_even = is_mm_mode and (cur_step % 2 == 0)
-        if is_mm_mode and hasattr(loss_fn, 'set_step_n'):
+        # Algorithm 2 still alternates. Algorithm 3 does not.
+        is_mm_algo2_even_step = is_mm_algo2  and (cur_step % 2 == 0)
+        if is_mm_algo2 and hasattr(loss_fn, 'set_step_n'):
             loss_fn.set_step_n(cur_step)
 
         # Compute LR multiplier: linear warmup then linear anneal to zero.
@@ -387,55 +400,75 @@ def training_loop(
         if os.environ.get('CD_DDP_DEBUG'):
             print(f'[RANK {dist.get_rank()}] zero_grad', flush=True)
 
-        if mm_is_even:
-            # MM even step: update auxiliary model phi.
-            # Student runs under no_grad inside loss_fn; pass raw net (no DDP).
+        if is_mm_algo2_even_step:
+        # Algorithm 2 even step: update auxiliary model phi.
+        # Student runs under no_grad inside loss_fn; pass raw net (not DDP).
             optimizer_aux.zero_grad(set_to_none=True)
+
             for round_idx in range(num_accumulation_rounds):
                 images, labels = next(dataset_iterator)
                 images = images.to(device, non_blocking=True).to(torch.float32) / 127.5 - 1
                 labels = labels.to(device, non_blocking=True)
+
                 loss = loss_fn(net=net, images=images, labels=labels, augment_pipe=augment_pipe)
                 training_stats.report('Loss/loss', loss)
                 loss.sum().mul(loss_scaling / batch_gpu_total).backward()
+
             # Manual gradient allreduce for auxiliary across ranks.
             for p in loss_fn.aux_net.parameters():
                 if p.grad is not None:
                     torch.nan_to_num(p.grad, nan=0, posinf=1e5, neginf=-1e5, out=p.grad)
                     torch.distributed.all_reduce(p.grad)
                     p.grad.div_(dist.get_world_size())
+
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(loss_fn.aux_net.parameters(), max_norm=grad_clip)
+
             for g in optimizer_aux.param_groups:
                 g['lr'] = current_lr_value
+
             optimizer_aux.step()
+
         else:
-            # Standard path (also used for MM odd steps).
+            # Standard student-optimizer path.
+            # Used for vanilla EDM, Algorithm 2 odd steps, and all Algorithm 3 steps.
             optimizer.zero_grad(set_to_none=True)
+
             for round_idx in range(num_accumulation_rounds):
-                if os.environ.get('CD_DDP_DEBUG'):
-                    print(f'[RANK {dist.get_rank()}] round {round_idx}: fetching batch', flush=True)
                 with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
-                    images, labels = next(dataset_iterator)
-                    if os.environ.get('CD_DDP_DEBUG'):
-                        print(f'[RANK {dist.get_rank()}] round {round_idx}: batch fetched, moving to device', flush=True)
-                    images = images.to(device, non_blocking=True).to(torch.float32) / 127.5 - 1
-                    labels = labels.to(device, non_blocking=True)
-                    if os.environ.get('CD_DDP_DEBUG'):
-                        print(f'[RANK {dist.get_rank()}] round {round_idx}: calling loss_fn', flush=True)
-                    loss = loss_fn(net=ddp, images=images, labels=labels, augment_pipe=augment_pipe)
-                    if os.environ.get('CD_DDP_DEBUG'):
-                        print(f'[RANK {dist.get_rank()}] round {round_idx}: loss computed, calling backward', flush=True)
+                    if is_mm_algo3:
+                        images_a, labels_a = next(dataset_iterator)
+                        images_b, labels_b = next(dataset_iterator)
+
+                        images_a = images_a.to(device, non_blocking=True).to(torch.float32) / 127.5 - 1
+                        labels_a = labels_a.to(device, non_blocking=True)
+
+                        images_b = images_b.to(device, non_blocking=True).to(torch.float32) / 127.5 - 1
+                        labels_b = labels_b.to(device, non_blocking=True)
+
+                        loss = loss_fn(
+                            net=ddp,
+                            images_a=images_a,
+                            labels_a=labels_a,
+                            images_b=images_b,
+                            labels_b=labels_b,
+                            augment_pipe=augment_pipe,
+                        )
+                    else:
+                        images, labels = next(dataset_iterator)
+                        images = images.to(device, non_blocking=True).to(torch.float32) / 127.5 - 1
+                        labels = labels.to(device, non_blocking=True)
+
+                        loss = loss_fn(net=ddp, images=images, labels=labels, augment_pipe=augment_pipe)
+
                     training_stats.report('Loss/loss', loss)
                     loss.sum().mul(loss_scaling / batch_gpu_total).backward()
-                    if os.environ.get('CD_DDP_DEBUG'):
-                        print(f'[RANK {dist.get_rank()}] round {round_idx}: backward done', flush=True)
 
         last_loss_scalar = float(loss.mean().detach().cpu().item())
 
         # Update weights.
         collect_step_metrics = step_metrics_every > 0 and (cur_step % step_metrics_every == 0)
-        if not mm_is_even:
+        if not is_mm_algo2_even_step:
             for g in optimizer.param_groups:
                 g['lr'] = current_lr_value
         current_lr = optimizer.param_groups[0]['lr']
@@ -443,7 +476,7 @@ def training_loop(
         param_global_norm = None
         true_update_over_param = None
         # Sanitize gradients always; only compute expensive global norms when step metrics are enabled.
-        if not mm_is_even:
+        if not is_mm_algo2_even_step:
             if collect_step_metrics:
                 total_grad_sq = torch.zeros([], device=device)
                 total_param_sq = torch.zeros([], device=device)
@@ -477,7 +510,13 @@ def training_loop(
             _ema_hl_nimg = ema_halflife_kimg * 1000
             if ema_rampup_ratio is not None:
                 _ema_hl_nimg = min(_ema_hl_nimg, cur_nimg * ema_rampup_ratio)
-            _ema_beta_log = 0.5 ** (batch_size / max(_ema_hl_nimg, 1e-8))
+            if use_ema_for_this_run:
+                _ema_hl_nimg = ema_halflife_kimg * 1000
+                if ema_rampup_ratio is not None:
+                    _ema_hl_nimg = min(_ema_hl_nimg, cur_nimg * ema_rampup_ratio)
+                _ema_beta_log = 0.5 ** (consumed_images_per_step / max(_ema_hl_nimg, 1e-8))
+            else:
+                _ema_beta_log = 0.0
             step_record = {
                 'step': cur_step,
                 'nimg': int(cur_nimg),
@@ -521,21 +560,28 @@ def training_loop(
 
         # Update EMA (validation/snapshot EMA).
         # In MM mode, only update EMA on odd steps (when student is updated).
-        if not mm_is_even:
+        if not is_mm_algo2_even_step:
+            use_ema_for_this_run = not is_mm_algo3
+
+        if use_ema_for_this_run:
             ema_halflife_nimg = ema_halflife_kimg * 1000
             if ema_rampup_ratio is not None:
                 ema_halflife_nimg = min(ema_halflife_nimg, cur_nimg * ema_rampup_ratio)
-            ema_beta = 0.5 ** (batch_size / max(ema_halflife_nimg, 1e-8))
+
+            ema_beta = 0.5 ** (consumed_images_per_step / max(ema_halflife_nimg, 1e-8))
             for p_ema, p_net in zip(ema.parameters(), net.parameters()):
                 p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
             ema_updates += 1
+        else:
+            # Keep EMA identical to current student so validation/snapshots still see current weights.
+            for p_ema, p_net in zip(ema.parameters(), net.parameters()):
+                p_ema.copy_(p_net.detach())
 
-            # Update power-function EMA profiles (post-hoc EMA basis).
-            if phema is not None:
-                phema.update(cur_nimg=(cur_nimg + batch_size), batch_size=batch_size)
+        if phema is not None and not is_mm_algo3:
+            phema.update(cur_nimg=(cur_nimg + consumed_images_per_step), batch_size=consumed_images_per_step)
 
         # Perform maintenance tasks once per tick.
-        cur_nimg += batch_size
+        cur_nimg += consumed_images_per_step
         done = (cur_nimg >= total_kimg * 1000)
         if (not done) and (cur_tick != 0) and (cur_nimg < tick_start_nimg + kimg_per_tick * 1000):
             continue
@@ -688,7 +734,7 @@ def training_loop(
             state_dict = dict(net=net, optimizer_state=optimizer.state_dict())
             if phema is not None:
                 state_dict['phema'] = phema.state_dict()
-            if is_mm_mode:
+            if is_mm_algo2:
                 state_dict['aux_net'] = loss_fn.aux_net
                 state_dict['optimizer_aux_state'] = optimizer_aux.state_dict()
             state_path = os.path.join(run_dir, f'training-state-{cur_nimg//1000:06d}.pt')
